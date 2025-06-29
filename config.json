@@ -1,0 +1,12 @@
+{
+    "mqtt_broker": "localhost",
+    "mqtt_port": 1883,
+    "mqtt_topic": "Camera/Snapshot",
+    "interval_true_false": 1000,
+    "interval_false_true": 400,
+    "log_file": "mqtt_messages.log",
+    "repeats": 10,
+    "true_message": "1",   
+    "false_message": "0",  
+    "ftp_folder_to_manage": "C:/RS_FTP"
+}
