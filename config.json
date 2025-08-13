@@ -2,11 +2,19 @@
     "mqtt_broker": "localhost",
     "mqtt_port": 1883,
     "mqtt_topic": "Camera/Snapshot",
-    "interval_true_false": 1000,
+    "interval_true_false": 5000,
     "interval_false_true": 400,
     "log_file": "mqtt_messages.log",
-    "repeats": 10,
+    "repeats": 2,
     "true_message": "1",   
     "false_message": "0",  
-    "ftp_folder_to_manage": "C:/RS_FTP"
+    "ftp_folder_to_manage": "C:/RS_FTP",
+    "ftp_management_delay_seconds": 2,
+    "google_sheet_name": "FTP_Analysis_Report",
+    "google_worksheet_name": "Test_Data_#2",
+    "tshark_enabled": true,    
+    "tshark_interface": "Ethernet", 
+    "tshark_temp_capture_file": "temp_capture.pcap",
+    "tshark_temp_csv_file": "temp_tshark_analysis.csv",
+    "camera_ips": ["192.168.1.90", "192.168.1.95"] 
 }
