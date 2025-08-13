@@ -6,7 +6,7 @@ import sys
 import os
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-from datetime import datetime
+from datetime import datetime, timezone
 import subprocess
 import platform
 import pandas as pd
@@ -33,7 +33,9 @@ def load_config(config_file="config.json"):
         "tshark_enabled": False,
         "tshark_interface": "",
         "tshark_temp_capture_file": "temp_capture.pcap",
-        "camera_ips": []
+        "camera_ips": [],
+        "save_tshark_capture": False,
+        "tshark_save_folder": "captures"
     }
     try:
         with open(config_file, 'r') as f:
@@ -122,7 +124,8 @@ def init_google_sheet(sheet_name, worksheet_name, credentials_file="google_crede
                 "avg_image_size_MB", "total_retransmissions", "zero_window_count",
                 "window_full_count", "avg_rtt_ms", "lost_segments_count",
                 "duplicate_ack_count", "measured_throughput_Mbps", "num_cameras_detected",
-                "ftp_conn_opened_timestamp", "ftp_conn_closed_timestamp", "FPS_Manual"
+                "ftp_conn_opened_timestamp", "ftp_conn_closed_timestamp", 
+                "Max_Data_Bleed_ms", "FPS_Manual"
             ]
             worksheet = sheet.add_worksheet(title=worksheet_name, rows=100, cols=len(headers))
             worksheet.append_row(headers)
@@ -151,46 +154,54 @@ def get_rtt_field_name():
         logging.warning(f"Could not detect tshark RTT field: {e}. RTT metrics will be unavailable.")
         return None
 
+def get_tshark_export_fields():
+    """Returns the list of fields to export from tshark."""
+    fields = [
+        "-e", "frame.time_epoch", "-e", "frame.len", "-e", "ip.src", "-e", "ip.dst",
+        "-e", "tcp.analysis.retransmission", "-e", "tcp.analysis.zero_window",
+        "-e", "tcp.analysis.window_full", "-e", "tcp.analysis.lost_segment",
+        "-e", "tcp.analysis.duplicate_ack", "-e", "ftp.request.command",
+        "-e", "ftp.response.code", "-e", "tcp.flags.syn", "-e", "tcp.flags.fin",
+        "-e", "tcp.flags.reset"
+    ]
+    rtt_field = get_rtt_field_name()
+    if rtt_field:
+        fields.extend(["-e", rtt_field])
+    return fields
+
 def calculate_metrics(df, duration_s, rtt_field, camera_ips):
-    """
-    Calculates network metrics from a pandas DataFrame.
-    This is the corrected version that handles missing columns properly.
-    """
+    """Calculates network metrics from a pandas DataFrame."""
     metrics = {}
+    metrics["total_retransmissions"] = int((df['tcp.analysis.retransmission'] != '').sum()) if 'tcp.analysis.retransmission' in df.columns else 0
+    metrics["zero_window_count"]     = int((df['tcp.analysis.zero_window'] != '').sum()) if 'tcp.analysis.zero_window' in df.columns else 0
+    metrics["window_full_count"]     = int((df['tcp.analysis.window_full'] != '').sum()) if 'tcp.analysis.window_full' in df.columns else 0
+    metrics["lost_segments_count"]   = int((df['tcp.analysis.lost_segment'] != '').sum()) if 'tcp.analysis.lost_segment' in df.columns else 0
+    metrics["duplicate_ack_count"]   = int((df['tcp.analysis.duplicate_ack'] != '').sum()) if 'tcp.analysis.duplicate_ack' in df.columns else 0
 
-    # FIXED: Use the safer `if col in df.columns` check to prevent incorrect zero values.
-    metrics["total_retransmissions"] = int(df['tcp.analysis.retransmission'].sum()) if 'tcp.analysis.retransmission' in df.columns else 0
-    metrics["zero_window_count"]     = int(df['tcp.analysis.zero_window'].sum()) if 'tcp.analysis.zero_window' in df.columns else 0
-    metrics["window_full_count"]     = int(df['tcp.analysis.window_full'].sum()) if 'tcp.analysis.window_full' in df.columns else 0
-    metrics["lost_segments_count"]   = int(df['tcp.analysis.lost_segment'].sum()) if 'tcp.analysis.lost_segment' in df.columns else 0
-    metrics["duplicate_ack_count"]   = int(df['tcp.analysis.duplicate_ack'].sum()) if 'tcp.analysis.duplicate_ack' in df.columns else 0
-
-    # FIXED: Reverted to 1024*1024 for throughput calculation to match original logic.
     if duration_s > 0 and 'frame.len' in df.columns:
         total_bytes = df['frame.len'].sum()
         metrics["measured_throughput_Mbps"] = (total_bytes * 8) / (duration_s * 1024 * 1024)
     else:
         metrics["measured_throughput_Mbps"] = 0.0
 
-    # RTT is provided in seconds by tshark, so multiply by 1000 to get milliseconds.
-    if rtt_field in df.columns and not df[rtt_field].dropna().empty:
-        metrics["avg_rtt_ms"] = df[rtt_field].dropna().mean() * 1000
+    if rtt_field in df.columns and df[rtt_field].astype(str).str.strip().ne('').any():
+        valid_rtts = pd.to_numeric(df[rtt_field], errors='coerce').dropna()
+        if not valid_rtts.empty:
+            metrics["avg_rtt_ms"] = valid_rtts.mean() * 1000
+        else:
+            metrics["avg_rtt_ms"] = 0.0
     else:
         metrics["avg_rtt_ms"] = 0.0
 
-    # --- Timestamps ---
     opened_ts, closed_ts = pd.NaT, pd.NaT
-    if 'tcp.flags.syn' in df.columns and 'ip.src' in df.columns:
-        syn_events = df[(df['tcp.flags.syn'] == 1) & (df['ip.src'].isin(camera_ips))]
-        if not syn_events.empty:
-            opened_ts = syn_events['frame.time'].min()
+    syn_events = df[(df['tcp.flags.syn'] == 'True') & (df['ip.src'].isin(camera_ips))]
+    if not syn_events.empty:
+        opened_ts = syn_events['frame.time'].min()
 
-    if 'tcp.flags.fin' in df.columns and 'ip.src' in df.columns and 'ip.dst' in df.columns:
-        fin_rst_events = df[((df['tcp.flags.fin'] == 1) | (df['tcp.flags.reset'] == 1)) & ((df['ip.src'].isin(camera_ips)) | (df['ip.dst'].isin(camera_ips)))]
-        if not fin_rst_events.empty:
-            closed_ts = fin_rst_events['frame.time'].max()
+    fin_rst_events = df[((df['tcp.flags.fin'] == 'True') | (df['tcp.flags.reset'] == 'True')) & ((df['ip.src'].isin(camera_ips)) | (df['ip.dst'].isin(camera_ips)))]
+    if not fin_rst_events.empty:
+        closed_ts = fin_rst_events['frame.time'].max()
 
-    # Fallback to FTP commands if primary TCP flags aren't found
     if pd.isna(opened_ts) and 'ftp.response.code' in df.columns:
         ftp_open_events = df[df['ftp.response.code'].str.startswith(('220', '230')) | df.get('ftp.request.command', pd.Series(dtype=str)).str.upper().str.contains('USER')]
         if not ftp_open_events.empty:
@@ -207,7 +218,7 @@ def calculate_metrics(df, duration_s, rtt_field, camera_ips):
     return metrics
 
 # --- Tshark Analysis Function ---
-def analyze_tshark_capture(capture_file_path, capture_duration_s, configured_camera_ips):
+def analyze_tshark_capture(capture_file_path, capture_duration_s, configured_camera_ips, true_timestamps, false_timestamps):
     """Exports and analyzes tshark capture data for network metrics."""
     default_metrics = {
         "total_retransmissions": 0, "zero_window_count": 0, "window_full_count": 0,
@@ -215,53 +226,36 @@ def analyze_tshark_capture(capture_file_path, capture_duration_s, configured_cam
         "measured_throughput_Mbps": 0.0, "num_cameras_detected": 0,
         "ftp_conn_opened_timestamp": "", "ftp_conn_closed_timestamp": ""
     }
+    max_bleed_times = {ip: 0 for ip in configured_camera_ips}
+    default_return = ({"overall": default_metrics, "per_camera": []}, max_bleed_times)
 
-    tshark_fields = [
-        "-e", "frame.time_epoch", "-e", "frame.len", "-e", "ip.src", "-e", "ip.dst",
-        "-e", "tcp.analysis.retransmission", "-e", "tcp.analysis.zero_window",
-        "-e", "tcp.analysis.window_full", "-e", "tcp.analysis.lost_segment",
-        "-e", "tcp.analysis.duplicate_ack", "-e", "ftp.request.command",
-        "-e", "ftp.response.code", "-e", "tcp.flags.syn", "-e", "tcp.flags.fin",
-        "-e", "tcp.flags.reset"
-    ]
-    rtt_field = get_rtt_field_name()
-    if rtt_field:
-        tshark_fields.extend(["-e", rtt_field])
-
+    tshark_fields = get_tshark_export_fields()
     temp_csv_file = "temp_tshark_analysis.csv"
     tshark_command = ["tshark", "-r", capture_file_path, "-T", "fields"] + tshark_fields + ["-E", "header=y", "-E", "separator=,", "-E", "quote=d"]
     
     try:
-        logging.info("Exporting tshark data to CSV...")
+        logging.info("Exporting tshark data to temporary CSV for analysis...")
         result = subprocess.run(tshark_command, check=True, capture_output=True, text=True)
         with open(temp_csv_file, 'w', newline='', encoding='utf-8') as f:
             f.write(result.stdout)
     except Exception as e:
         logging.error(f"Tshark export failed: {e}", exc_info=True)
-        return {"overall": default_metrics, "per_camera": []}
+        return default_return
 
     try:
-        df = pd.read_csv(temp_csv_file)
-        if 'frame.time_epoch' in df.columns:
-            df.rename(columns={'frame.time_epoch': 'frame.time'}, inplace=True)
-            df['frame.time'] = pd.to_datetime(df['frame.time'], unit='s', errors='coerce')
-        else: # Fallback
-            df['frame.time'] = pd.to_datetime(df['frame.time'], errors='coerce')
+        df = pd.read_csv(temp_csv_file, dtype=str).fillna('')
+        # CORRECTED: Ensure the datetime objects are timezone-aware (UTC)
+        df['frame.time'] = pd.to_datetime(df['frame.time_epoch'], unit='s', errors='coerce').dt.tz_localize('UTC')
+        df['frame.len'] = pd.to_numeric(df['frame.len'], errors='coerce').fillna(0)
 
-        # Clean up data types
-        for col in df.columns:
-            if col.startswith(('tcp.analysis', 'tcp.flags', 'frame.len')):
-                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
-            elif col.startswith(('ip.', 'ftp.')):
-                df[col] = df[col].astype(str).str.strip().fillna('')
-
-        # --- Overall Analysis ---
         detected_ips = {ip for ip in configured_camera_ips if (df['ip.src'] == ip).any() or (df['ip.dst'] == ip).any()}
+        ftp_server_ip = next((ip for ip in pd.concat([df['ip.src'], df['ip.dst']]).unique() if ip not in configured_camera_ips and not (ip.startswith('192.168.') and ip.endswith('.255'))), None)
+        rtt_field = get_rtt_field_name()
+        
         overall_metrics = calculate_metrics(df, capture_duration_s, rtt_field, configured_camera_ips)
         overall_metrics["num_cameras_detected"] = len(detected_ips)
         logging.info(f"Overall analysis results: {overall_metrics}")
 
-        # --- Per-Camera Analysis ---
         per_camera_metrics_list = []
         for ip in detected_ips:
             df_cam = df[(df['ip.src'] == ip) | (df['ip.dst'] == ip)].copy()
@@ -270,14 +264,40 @@ def analyze_tshark_capture(capture_file_path, capture_duration_s, configured_cam
             per_camera_metrics_list.append({"ip": ip, "metrics": cam_metrics})
             logging.info(f"Analysis for {ip}: {cam_metrics}")
 
+        # --- Calculate Max Data Bleed Time ---
+        if len(true_timestamps) > 1 and ftp_server_ip:
+            logging.info(f"Analyzing data bleed during 'off' intervals. FTP Server detected: {ftp_server_ip}")
+            for i in range(len(true_timestamps) - 1):
+                start_off_period = false_timestamps[i]
+                end_off_period = true_timestamps[i+1]
+                
+                for ip in configured_camera_ips:
+                    off_period_df = df[
+                        (df['frame.time'] >= start_off_period) & 
+                        (df['frame.time'] < end_off_period) &
+                        (df['ip.src'] == ip) &
+                        (df['ip.dst'] == ftp_server_ip)
+                    ]
+                    data_packets = off_period_df[off_period_df['frame.len'] > 100]
+                    
+                    if not data_packets.empty:
+                        last_packet_time = data_packets['frame.time'].max()
+                        bleed_time = (last_packet_time - start_off_period).total_seconds() * 1000
+                        
+                        if bleed_time > max_bleed_times[ip]:
+                            max_bleed_times[ip] = bleed_time
+                        
+                        logging.warning(f"Camera {ip} sent data for {bleed_time:.2f}ms into 'off' interval {i+1}.")
+        
+        analysis_result = {"overall": overall_metrics, "per_camera": per_camera_metrics_list}
+        return analysis_result, max_bleed_times
+
     except Exception as e:
         logging.error(f"Error analyzing tshark CSV: {e}", exc_info=True)
-        return {"overall": default_metrics, "per_camera": []}
+        return default_return
     finally:
         if os.path.exists(temp_csv_file):
             os.remove(temp_csv_file)
-    
-    return {"overall": overall_metrics, "per_camera": per_camera_metrics_list}
 
 # --- Main Application Logic ---
 def run_analyzer():
@@ -327,15 +347,21 @@ def run_analyzer():
                 logging.error(f"Failed to start tshark: {e}", exc_info=True)
                 tshark_process = None
     
+    true_message_timestamps = []
+    false_message_timestamps = []
     try:
         logging.info(f"Starting MQTT publication to topic '{config['mqtt_topic']}' for {config['repeats']} cycles.")
         loop_iterator = range(config['repeats']) if config['repeats'] != -1 else iter(int, 1)
         for i in loop_iterator:
             client.publish(config["mqtt_topic"], config["true_message"])
+            # CORRECTED: Use timezone-aware UTC timestamps
+            true_message_timestamps.append(datetime.now(timezone.utc))
             logging.info(f"Published '{config['true_message']}' (Cycle {i+1})")
             time.sleep(config["interval_true_false"] / 1000.0)
 
             client.publish(config["mqtt_topic"], config["false_message"])
+            # CORRECTED: Use timezone-aware UTC timestamps
+            false_message_timestamps.append(datetime.now(timezone.utc))
             logging.info(f"Published '{config['false_message']}' (Cycle {i+1})")
             time.sleep(config["interval_false_true"] / 1000.0)
         logging.info("Finished all test cycles.")
@@ -366,8 +392,15 @@ def run_analyzer():
             per_camera_ftp_data[ip] = {"files_before": num_before, "avg_bytes_per_file": avg_bytes, "files_after": num_after}
 
         analysis_results = None
+        max_bleed_times = {ip: 0 for ip in config["camera_ips"]}
         if config["tshark_enabled"] and os.path.exists(config["tshark_temp_capture_file"]):
-            analysis_results = analyze_tshark_capture(config["tshark_temp_capture_file"], capture_duration_s, config["camera_ips"])
+            analysis_results, max_bleed_times = analyze_tshark_capture(
+                config["tshark_temp_capture_file"], 
+                capture_duration_s, 
+                config["camera_ips"],
+                true_message_timestamps,
+                false_message_timestamps
+            )
         
         current_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
         rows_to_append = []
@@ -385,7 +418,8 @@ def run_analyzer():
                 o_metrics["total_retransmissions"], o_metrics["zero_window_count"], o_metrics["window_full_count"],
                 f"{o_metrics['avg_rtt_ms']:.2f}", o_metrics["lost_segments_count"], o_metrics["duplicate_ack_count"],
                 f"{o_metrics['measured_throughput_Mbps']:.4f}", o_metrics["num_cameras_detected"],
-                o_metrics["ftp_conn_opened_timestamp"], o_metrics["ftp_conn_closed_timestamp"], ""
+                o_metrics["ftp_conn_opened_timestamp"], o_metrics["ftp_conn_closed_timestamp"],
+                f"{max(max_bleed_times.values()):.2f}", ""
             ]
             rows_to_append.append(overall_row)
             
@@ -401,7 +435,8 @@ def run_analyzer():
                     c_metrics["total_retransmissions"], c_metrics["zero_window_count"], c_metrics["window_full_count"],
                     f"{c_metrics['avg_rtt_ms']:.2f}", c_metrics["lost_segments_count"], c_metrics["duplicate_ack_count"],
                     f"{c_metrics['measured_throughput_Mbps']:.4f}", c_metrics["num_cameras_detected"],
-                    c_metrics["ftp_conn_opened_timestamp"], c_metrics["ftp_conn_closed_timestamp"], ""
+                    c_metrics["ftp_conn_opened_timestamp"], c_metrics["ftp_conn_closed_timestamp"],
+                    f"{max_bleed_times.get(ip, 0):.2f}", ""
                 ]
                 rows_to_append.append(cam_row)
         try:
@@ -411,8 +446,28 @@ def run_analyzer():
         except Exception as e:
             logging.error(f"Failed to append data to Google Sheet: {e}", exc_info=True)
 
-        if os.path.exists(config["tshark_temp_capture_file"]):
+        if config["tshark_enabled"] and os.path.exists(config["tshark_temp_capture_file"]):
+            if config.get("save_tshark_capture", False):
+                save_folder = config.get("tshark_save_folder", "captures")
+                os.makedirs(save_folder, exist_ok=True)
+                
+                save_filename = f"capture_{current_timestamp.replace(':', '-')}.csv"
+                destination_path = os.path.join(save_folder, save_filename)
+                
+                tshark_fields = get_tshark_export_fields()
+                tshark_command = ["tshark", "-r", config["tshark_temp_capture_file"], "-T", "fields"] + tshark_fields + ["-E", "header=y", "-E", "separator=,", "-E", "quote=d"]
+                
+                try:
+                    logging.info(f"Saving full packet data to CSV: {destination_path}")
+                    result = subprocess.run(tshark_command, check=True, capture_output=True, text=True)
+                    with open(destination_path, 'w', newline='', encoding='utf-8') as f:
+                        f.write(result.stdout)
+                    logging.info("Successfully saved CSV capture file.")
+                except Exception as e:
+                    logging.error(f"Could not save tshark data to CSV: {e}")
+            
             os.remove(config["tshark_temp_capture_file"])
+            logging.info(f"Deleted temporary capture file: {config['tshark_temp_capture_file']}")
         
         logging.info("Analyzer tool finished operations.")
 
